@@ -53,11 +53,16 @@ jobs:
         deepspeed/inference/v2/
         tests/unit/inference/v2/
 
-  unit-tests:
-    name: cpu-torch-latest / unit tests
+  unit-tests-shard:
+    name: cpu-torch-latest / unit tests (${{ matrix.shard }})
     needs: check-paths
     if: ${{ !cancelled() && (needs.check-paths.result != 'success' || needs.check-paths.outputs.should_run == 'true') }}
     runs-on: ubuntu-24.04
+    timeout-minutes: 60
+    strategy:
+      fail-fast: false
+      matrix:
+        shard: [v1-ops, rest]
 
     env:
       DEFAULT_TORCH_PRESET: '2.10.0-cpu'
@@ -253,5 +258,29 @@ jobs:
         run: |
           unset TORCH_CUDA_ARCH_LIST # only jit compile for current arch
           cd tests
-          HF_HOME=/tmp/hf_home/ pytest $PYTEST_OPTS --forked -n 4 unit/ --torch_ver="$TORCH_TEST_VERSION"
-          HF_HOME=/tmp/hf_home/ pytest $PYTEST_OPTS --forked -m 'sequential' unit/ --torch_ver="$TORCH_TEST_VERSION"
+          # Two shards; their union is exactly unit/. The sequential pass runs once, in the "rest" shard.
+          if [ "${{ matrix.shard }}" = 'v1-ops' ]; then
+            HF_HOME=/tmp/hf_home/ pytest $PYTEST_OPTS --forked -n 4 unit/v1 unit/ops --torch_ver="$TORCH_TEST_VERSION"
+          else
+            HF_HOME=/tmp/hf_home/ pytest $PYTEST_OPTS --forked -n 4 unit/ --ignore=unit/v1 --ignore=unit/ops --torch_ver="$TORCH_TEST_VERSION"
+            HF_HOME=/tmp/hf_home/ pytest $PYTEST_OPTS --forked -m 'sequential' unit/ --torch_ver="$TORCH_TEST_VERSION"
+          fi
+
+  # Keeps the required status check name stable for branch protection and the merge queue.
+  unit-tests:
+    name: cpu-torch-latest / unit tests
+    needs: [check-paths, unit-tests-shard]
+    if: ${{ !cancelled() }}
+    runs-on: ubuntu-24.04
+    steps:
+      - name: Check shard results
+        env:
+          PATHS_RESULT: ${{ needs.check-paths.result }}
+          SHARDS_RESULT: ${{ needs.unit-tests-shard.result }}
+        run: |
+          echo "check-paths: $PATHS_RESULT, shards: $SHARDS_RESULT"
+          if [ "$PATHS_RESULT" != 'success' ]; then exit 1; fi
+          case "$SHARDS_RESULT" in
+            success|skipped) exit 0 ;;
+            *) exit 1 ;;
+          esac
